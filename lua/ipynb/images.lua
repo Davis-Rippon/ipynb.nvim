@@ -1,7 +1,9 @@
 -- ipynb/images.lua - Image output rendering using image.nvim
--- Uses image.nvim for dimension reading and image object lifecycle,
--- with direct Kitty Graphics Protocol commands for terminal transmission.
--- Uses vendored placeholder generation for true text/image interleaving in virt_lines.
+-- Supports two rendering paths:
+--   1. Kitty/Ghostty/WezTerm: direct Kitty Graphics Protocol + Unicode placeholders
+--      for true text/image interleaving in virt_lines.
+--   2. Other terminals: delegates to image.nvim's native rendering pipeline which
+--      auto-selects the appropriate backend (ueberzug, sixel, etc.).
 
 local M = {}
 
@@ -16,7 +18,22 @@ local M = {}
 ---@field image_height number Pixel height
 ---@field path string File path
 ---@field source_format string|nil Original image format (png, jpeg, etc.)
+---@field geometry ImageGeometry
+---@field rendered_geometry ImageGeometry
+---@field is_rendered boolean
+---@field inline boolean
+---@field with_virtual_padding boolean
+---@field window number|nil
+---@field buffer number|nil
+---@field render fun(self: ImageNvim, geometry?: table)
 ---@field clear fun(self: ImageNvim, shallow?: boolean)
+---@field move fun(self: ImageNvim, x: number, y: number)
+
+---@class ImageGeometry
+---@field x? number
+---@field y? number
+---@field width? number
+---@field height? number
 
 --------------------------------------------------------------------------------
 
@@ -118,6 +135,37 @@ local TEXT_MIME_TYPES = {
 -- Cache for image.nvim availability check
 local image_available = nil
 
+-- Cache for Kitty Unicode placeholder support detection
+local kitty_placeholders_available = nil
+
+--------------------------------------------------------------------------------
+-- Terminal capability detection
+--------------------------------------------------------------------------------
+
+---Detect whether the terminal supports Kitty Unicode placeholders.
+---Kitty, Ghostty, and WezTerm support this natively.
+---@return boolean
+local function supports_kitty_placeholders()
+	if kitty_placeholders_available ~= nil then
+		return kitty_placeholders_available
+	end
+
+	local term = os.getenv("TERM") or ""
+	local term_program = os.getenv("TERM_PROGRAM") or ""
+
+	if term == "xterm-kitty" or term_program == "kitty" then
+		kitty_placeholders_available = true
+	elseif term_program == "Ghostty" then
+		kitty_placeholders_available = true
+	elseif term_program == "WezTerm" then
+		kitty_placeholders_available = true
+	else
+		kitty_placeholders_available = false
+	end
+
+	return kitty_placeholders_available
+end
+
 ---Convert pixel dimensions to terminal cells
 ---@param width_px number|nil Width in pixels
 ---@param height_px number|nil Height in pixels
@@ -148,6 +196,67 @@ local function pixels_to_cells(width_px, height_px)
 	end
 
 	return width_cells, height_cells
+end
+
+---Calculate scaled image dimensions that fit within the available area
+---@param native_width_cells number|nil Native width in cells
+---@param native_height_cells number|nil Native height in cells
+---@param text_width number Available width in cells
+---@param max_img_height number Maximum height in cells
+---@return number img_width Scaled width
+---@return number img_height Scaled height
+local function calculate_scaled_dimensions(native_width_cells, native_height_cells, text_width, max_img_height)
+	local img_width = native_width_cells or text_width
+	local img_height = native_height_cells or max_img_height
+
+	if native_width_cells and native_height_cells and native_width_cells > text_width then
+		local scale = text_width / native_width_cells
+		img_width = text_width
+		img_height = math.floor(native_height_cells * scale + 0.5)
+	end
+
+	if img_height > max_img_height then
+		local scale = max_img_height / img_height
+		img_height = max_img_height
+		img_width = math.floor(img_width * scale + 0.5)
+	end
+
+	img_width = math.max(1, img_width)
+	img_height = math.max(1, img_height)
+
+	return img_width, img_height
+end
+
+---Find the facade window and compute available dimensions
+---@param state NotebookState
+---@param img_config table Image configuration
+---@return number|nil facade_win Facade window handle
+---@return number text_width Available width in cells
+---@return number max_img_height Maximum height in cells
+local function compute_display_area(state, img_config)
+	local width_padding = 2
+	local height_padding = 1
+
+	local facade_win = nil
+	for _, win in ipairs(vim.api.nvim_list_wins()) do
+		if vim.api.nvim_win_get_buf(win) == state.facade_buf then
+			facade_win = win
+			break
+		end
+	end
+
+	local text_width, max_img_height
+	if facade_win then
+		local wininfo = vim.fn.getwininfo(facade_win)[1]
+		text_width = vim.api.nvim_win_get_width(facade_win) - (wininfo and wininfo.textoff or 0) - width_padding
+		max_img_height = img_config.max_height
+			or (vim.api.nvim_win_get_height(facade_win) - vim.wo[facade_win].scrolloff - height_padding)
+	else
+		text_width = vim.o.columns - width_padding
+		max_img_height = img_config.max_height or (vim.o.lines - height_padding)
+	end
+
+	return facade_win, text_width, max_img_height
 end
 
 --------------------------------------------------------------------------------
@@ -192,8 +301,39 @@ local function write_binary_file(path, data)
 	return ok_write ~= nil
 end
 
+---Convert a non-PNG image file to PNG using ImageMagick
+---@param path string Input file path
+---@return string|nil png_path Path to PNG file (same as input if already PNG, converted path otherwise)
+local function ensure_png(path)
+	-- Check if already PNG by reading magic bytes
+	local f = io.open(path, "rb")
+	if not f then
+		return nil
+	end
+	local header = f:read(8)
+	f:close()
+	if header and #header >= 4 and header:byte(1) == 0x89 and header:byte(2) == 0x50 and header:byte(3) == 0x4E
+		and header:byte(4) == 0x47
+	then
+		return path -- Already PNG
+	end
+
+	-- Convert to PNG via ImageMagick
+	local output_path = path .. ".png"
+	for _, cmd_name in ipairs({ "magick", "convert" }) do
+		local cmd = string.format("%s '%s' '%s' 2>/dev/null", cmd_name, path, output_path)
+		os.execute(cmd)
+		local check = io.open(output_path, "rb")
+		if check then
+			check:close()
+			return output_path
+		end
+	end
+	return nil
+end
+
 --------------------------------------------------------------------------------
--- Kitty Graphics Protocol helpers
+-- Kitty Graphics Protocol helpers (used only by the Kitty rendering path)
 --------------------------------------------------------------------------------
 
 ---Send a raw Kitty protocol escape sequence to the terminal (with tmux wrapping)
@@ -207,7 +347,6 @@ local function send_kitty_command(payload)
 end
 
 ---Transmit image file data to the terminal via Kitty direct (base64) method.
----Reads the file, base64-encodes it, and sends in chunks.
 ---@param img_id number Kitty image ID
 ---@param file_path string Absolute path to image file on disk
 local function send_transmit_request(img_id, file_path)
@@ -259,52 +398,20 @@ local function send_clear_placement_request(img_id, placement_id)
 	send_kitty_command(payload)
 end
 
----Convert a non-PNG image file to PNG using ImageMagick (required by Kitty protocol)
----@param path string Input file path
----@return string|nil png_path Path to PNG file (same as input if already PNG, converted path otherwise)
-local function ensure_png(path)
-	-- Check if already PNG by reading magic bytes
-	local f = io.open(path, "rb")
-	if not f then
-		return nil
-	end
-	local header = f:read(8)
-	f:close()
-	if header and #header >= 4 and header:byte(1) == 0x89 and header:byte(2) == 0x50 and header:byte(3) == 0x4E
-		and header:byte(4) == 0x47
-	then
-		return path -- Already PNG
-	end
-
-	-- Convert to PNG via ImageMagick
-	local output_path = path .. ".png"
-	-- Try 'magick' (ImageMagick 7+) first, then 'convert' (ImageMagick 6)
-	for _, cmd_name in ipairs({ "magick", "convert" }) do
-		local cmd = string.format("%s '%s' '%s' 2>/dev/null", cmd_name, path, output_path)
-		os.execute(cmd)
-		-- Verify the output file was created
-		local check = io.open(output_path, "rb")
-		if check then
-			check:close()
-			return output_path
-		end
-	end
-	return nil
-end
-
 --------------------------------------------------------------------------------
 -- image.nvim Image object cache
 --------------------------------------------------------------------------------
 
--- Storage for image.nvim Image objects (used for dimension reading and lifecycle)
+-- Storage for image.nvim Image objects
 local image_cache = {} ---@type table<string, ImageNvim>
 
 ---Get or create an image.nvim Image object for a file path.
----The Image provides pixel dimensions and a unique internal_id for Kitty protocol.
+---Pass extra options when creating for native rendering (window/buffer/inline).
 ---@param path string Path to image file
+---@param opts table|nil Extra options for from_file
 ---@return ImageNvim|nil
-local function get_or_create_image(path)
-	if image_cache[path] then
+local function get_or_create_image(path, opts)
+	if not opts and image_cache[path] then
 		return image_cache[path]
 	end
 
@@ -313,14 +420,85 @@ local function get_or_create_image(path)
 		return nil
 	end
 
-	-- from_file reads dimensions via processor; requires setup() to have been called.
-	-- Pass id=path for deduplication so the same file reuses the existing Image.
-	local ok_from, img = pcall(image_api.from_file, path, { id = path })
+	local from_opts = vim.tbl_extend("force", { id = path }, opts or {})
+	local ok_from, img = pcall(image_api.from_file, path, from_opts)
 	if ok_from and img then
-		image_cache[path] = img
+		if not opts then
+			image_cache[path] = img
+		end
 		return img
 	end
 	return nil
+end
+
+---Prepare the image file (decode, write cache, convert to PNG if needed).
+---Returns the Image object and the path suitable for transmission/rendering.
+---@param state NotebookState
+---@param cell table Cell object
+---@param output table Output object
+---@param image_index number
+---@return ImageNvim|nil img The image.nvim Image object
+---@return string|nil cache_path Path to the original cache file
+---@return string|nil transmit_path Path suitable for Kitty transmission (PNG)
+---@return number native_width_px
+---@return number native_height_px
+---@return number img_width Scaled width in cells
+---@return number img_height Scaled height in cells
+---@return number|nil facade_win
+local function prepare_image(state, cell, output, image_index)
+	local has_image, mime, image_data, is_text = M.get_image_data(output)
+	if not has_image or not mime or not image_data then
+		return nil
+	end
+
+	local cell_id = cell.id
+	if not cell_id then
+		return nil
+	end
+
+	local file_content
+	if is_text then
+		file_content = image_data
+	else
+		file_content = base64_decode(image_data)
+	end
+	if not file_content then
+		return nil
+	end
+
+	local cache_dir = get_cache_dir()
+	local ext = MIME_EXTENSIONS[mime] or "png"
+	local data_hash = vim.fn.sha256(image_data):sub(1, 12)
+	local filename = string.format("%s-%d-%s.%s", cell_id, image_index, data_hash, ext)
+	local path = cache_dir .. "/" .. filename
+
+	if not write_binary_file(path, file_content) then
+		return nil
+	end
+
+	if image_cache[path] then
+		pcall(image_cache[path].clear, image_cache[path])
+		image_cache[path] = nil
+	end
+
+	local img = get_or_create_image(path)
+	if not img then
+		return nil
+	end
+
+	local native_width_px = img.image_width
+	local native_height_px = img.image_height
+	if not native_width_px or not native_height_px or native_width_px <= 0 or native_height_px <= 0 then
+		return nil
+	end
+
+	local native_width_cells, native_height_cells = pixels_to_cells(native_width_px, native_height_px)
+	local config = require("ipynb.config").get()
+	local img_config = config.images or {}
+	local facade_win, text_width, max_img_height = compute_display_area(state, img_config)
+	local img_width, img_height = calculate_scaled_dimensions(native_width_cells, native_height_cells, text_width, max_img_height)
+
+	return img, path, nil, native_width_px, native_height_px, img_width, img_height, facade_win
 end
 
 --------------------------------------------------------------------------------
@@ -344,12 +522,8 @@ function M.is_available()
 		return false
 	end
 
-	-- Verify image.nvim is actually set up by probing from_file.
-	-- from_file throws if setup() hasn't been called.
 	local probe_ok = pcall(image_api.from_file, "/dev/null")
 	if not probe_ok then
-		-- setup() hasn't been called; try to initialize with defaults.
-		-- Safe because the user's own setup() (if any) will re-initialize later.
 		pcall(image_api.setup, {})
 	end
 
@@ -357,10 +531,10 @@ function M.is_available()
 	return true
 end
 
----Check if terminal supports Unicode placeholders (required for virt_lines images)
+---Check if terminal supports Unicode placeholders (Kitty/Ghostty/WezTerm)
 ---@return boolean
 function M.supports_placeholders()
-	return M.is_available()
+	return M.is_available() and supports_kitty_placeholders()
 end
 
 ---Check if output has any image data
@@ -393,7 +567,8 @@ function M.get_image_data(output)
 	return false, nil, nil, false
 end
 
----Generate virt_lines entries for an image output
+---Generate virt_lines entries for an image output.
+---Dispatches to the Kitty placeholder path or the image.nvim native path.
 ---@param state NotebookState
 ---@param cell table Cell object
 ---@param output table Output object containing image data
@@ -401,149 +576,95 @@ end
 ---@return table[]|nil virt_line_entries Array of virt_line entries, or nil if failed
 ---@return number height Height of the image in terminal rows
 function M.get_image_virt_lines(state, cell, output, image_index)
-	if not M.supports_placeholders() then
+	if not M.is_available() then
 		return nil, 0
 	end
 
-	local has_image, mime, image_data, is_text = M.get_image_data(output)
-	if not has_image or not mime or not image_data then
-		return nil, 0
-	end
-
-	local cell_id = cell.id
-	if not cell_id then
-		return nil, 0
-	end
-
-	-- Decode/get file content
-	local file_content
-	if is_text then
-		file_content = image_data
-	else
-		file_content = base64_decode(image_data)
-	end
-
-	if not file_content then
-		return nil, 0
-	end
-
-	-- Write to cache file
-	local cache_dir = get_cache_dir()
-	local ext = MIME_EXTENSIONS[mime] or "png"
-	local data_hash = vim.fn.sha256(image_data):sub(1, 12)
-	local filename = string.format("%s-%d-%s.%s", cell_id, image_index, data_hash, ext)
-	local path = cache_dir .. "/" .. filename
-
-	if not write_binary_file(path, file_content) then
-		return nil, 0
-	end
-
-	-- File content may have changed between executions for the same cell/image index.
-	-- Drop cached object so we reload fresh metadata from disk.
-	if image_cache[path] then
-		pcall(image_cache[path].clear, image_cache[path])
-		image_cache[path] = nil
-	end
-
-	-- Get or create image.nvim Image object (for dimensions and Kitty image ID)
-	local img = get_or_create_image(path)
+	local img, cache_path, _, _, _, img_width, img_height, facade_win =
+		prepare_image(state, cell, output, image_index)
 	if not img then
 		return nil, 0
 	end
 
-	-- Get dimensions from image.nvim Image
-	local native_width_px = img.image_width
-	local native_height_px = img.image_height
-	if not native_width_px or not native_height_px or native_width_px <= 0 or native_height_px <= 0 then
-		return nil, 0
-	end
+	local cell_id = cell.id
 
-	local native_width_cells, native_height_cells = pixels_to_cells(native_width_px, native_height_px)
-
-	-- Get config for size limits
-	local config = require("ipynb.config").get()
-	local img_config = config.images or {}
-
-	-- Padding constants for image sizing
-	local width_padding = 2 -- horizontal margin to avoid overflow
-	local height_padding = 1 -- vertical margin to guarantee cursor landing with image fully visible
-
-	-- Find facade window to get stable dimensions (avoids resize when undo triggered from edit float)
-	local facade_win = nil
-	for _, win in ipairs(vim.api.nvim_list_wins()) do
-		if vim.api.nvim_win_get_buf(win) == state.facade_buf then
-			facade_win = win
-			break
+	if supports_kitty_placeholders() then
+		---------------------------------------------------------------
+		-- Path A: Kitty / Ghostty / WezTerm — direct Kitty protocol
+		---------------------------------------------------------------
+		local transmit_path = ensure_png(cache_path)
+		if not transmit_path then
+			return nil, 0
 		end
-	end
 
-	local text_width, max_img_height
-	if facade_win then
-		local wininfo = vim.fn.getwininfo(facade_win)[1]
-		text_width = vim.api.nvim_win_get_width(facade_win) - (wininfo and wininfo.textoff or 0) - width_padding
-		max_img_height = img_config.max_height
-			or (vim.api.nvim_win_get_height(facade_win) - vim.wo[facade_win].scrolloff - height_padding)
+		local internal_id = img.internal_id or 1
+		send_transmit_request(internal_id, transmit_path)
+
+		local placement_id = next_placement_id()
+		send_placement_request(internal_id, placement_id, img_width, img_height)
+
+		local placeholder_lines, hl_group = generate_placeholder_grid(internal_id, placement_id, img_width, img_height)
+
+		local virt_line_entries = {}
+		for _, line in ipairs(placeholder_lines) do
+			table.insert(virt_line_entries, { { line, hl_group } })
+		end
+
+		state.images = state.images or {}
+		state.images[cell_id] = state.images[cell_id] or {}
+		table.insert(state.images[cell_id], {
+			img = img,
+			placement_id = placement_id,
+			path = cache_path,
+			png_path = transmit_path ~= cache_path and transmit_path or nil,
+			rendering = "kitty",
+		})
+
+		return virt_line_entries, img_height
 	else
-		-- Fallback to terminal size if facade window not found
-		text_width = vim.o.columns - width_padding
-		max_img_height = img_config.max_height or (vim.o.lines - height_padding)
+		---------------------------------------------------------------
+		-- Path B: Other terminals — delegate to image.nvim rendering
+		---------------------------------------------------------------
+		-- Create an image associated with the notebook window/buffer
+		-- so image.nvim renders via its configured backend (ueberzug,
+		-- sixel, etc.).
+		if not facade_win then
+			return nil, 0
+		end
+
+		local native_img = get_or_create_image(cache_path, {
+			window = facade_win,
+			buffer = state.facade_buf,
+			with_virtual_padding = true,
+			inline = true,
+			width = img_width,
+			height = img_height,
+		})
+		if not native_img then
+			return nil, 0
+		end
+
+		-- Let image.nvim handle rendering via its backend.
+		-- It will create its own extmark with virtual padding.
+		pcall(native_img.render, native_img)
+
+		-- Reserve virt_lines space so the cell output stays clear.
+		-- We return empty lines; the actual image is rendered by image.nvim.
+		local virt_line_entries = {}
+		for _ = 1, img_height do
+			table.insert(virt_line_entries, { { "", "" } })
+		end
+
+		state.images = state.images or {}
+		state.images[cell_id] = state.images[cell_id] or {}
+		table.insert(state.images[cell_id], {
+			img = native_img,
+			path = cache_path,
+			rendering = "native",
+		})
+
+		return virt_line_entries, img_height
 	end
-
-	-- Calculate scaled dimensions
-	local img_width = native_width_cells or text_width
-	local img_height = native_height_cells or max_img_height
-
-	if native_width_cells and native_height_cells and native_width_cells > text_width then
-		local scale = text_width / native_width_cells
-		img_width = text_width
-		img_height = math.floor(native_height_cells * scale + 0.5)
-	end
-
-	if img_height > max_img_height then
-		local scale = max_img_height / img_height
-		img_height = max_img_height
-		img_width = math.floor(img_width * scale + 0.5)
-	end
-
-	img_width = math.max(1, img_width)
-	img_height = math.max(1, img_height)
-
-	-- Ensure image is PNG for Kitty protocol (only f=100/PNG is standard)
-	local transmit_path = ensure_png(path)
-	if not transmit_path then
-		return nil, 0
-	end
-
-	-- Transmit image data to terminal via Kitty file reference.
-	-- NOTE: We do NOT call img:render() because that triggers image.nvim's own
-	-- display pipeline which sends a conflicting placement command.
-	local internal_id = img.internal_id or 1
-	send_transmit_request(internal_id, transmit_path)
-
-	-- Generate unique placement ID and send placement command
-	local placement_id = next_placement_id()
-	send_placement_request(internal_id, placement_id, img_width, img_height)
-
-	-- Generate placeholder grid lines (encodes image_id + placement_id in highlight)
-	local placeholder_lines, hl_group = generate_placeholder_grid(internal_id, placement_id, img_width, img_height)
-
-	-- Convert to virt_lines format
-	local virt_line_entries = {}
-	for _, line in ipairs(placeholder_lines) do
-		table.insert(virt_line_entries, { { line, hl_group } })
-	end
-
-	-- Track for cleanup
-	state.images = state.images or {}
-	state.images[cell_id] = state.images[cell_id] or {}
-	table.insert(state.images[cell_id], {
-		img = img,
-		placement_id = placement_id,
-		path = path,
-		png_path = transmit_path ~= path and transmit_path or nil,
-	})
-
-	return virt_line_entries, img_height
 end
 
 ---Clear images for a cell
@@ -555,21 +676,31 @@ function M.clear_images(state, cell_id)
 	end
 
 	for _, entry in ipairs(state.images[cell_id]) do
-		-- Clear image.nvim Image from terminal and registry
-		if entry.img then
-			pcall(entry.img.clear, entry.img)
-		end
-		-- Remove from our local cache
-		if entry.path and image_cache[entry.path] then
-			image_cache[entry.path] = nil
-		end
-		-- Delete converted PNG if we created one
-		if entry.png_path then
-			pcall(vim.fn.delete, entry.png_path)
-		end
-		-- Delete the original cache file
-		if entry.path then
-			pcall(vim.fn.delete, entry.path)
+		if entry.rendering == "kitty" then
+			-- Kitty path: clear via image.nvim + delete cache files
+			if entry.img then
+				pcall(entry.img.clear, entry.img)
+			end
+			if entry.path and image_cache[entry.path] then
+				image_cache[entry.path] = nil
+			end
+			if entry.png_path then
+				pcall(vim.fn.delete, entry.png_path)
+			end
+			if entry.path then
+				pcall(vim.fn.delete, entry.path)
+			end
+		else
+			-- Native path: image.nvim manages the lifecycle
+			if entry.img then
+				pcall(entry.img.clear, entry.img)
+			end
+			if entry.path and image_cache[entry.path] then
+				image_cache[entry.path] = nil
+			end
+			if entry.path then
+				pcall(vim.fn.delete, entry.path)
+			end
 		end
 	end
 
