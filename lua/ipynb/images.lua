@@ -567,6 +567,71 @@ function M.get_image_data(output)
 	return false, nil, nil, false
 end
 
+---Extract image data from HTML content containing <img> tags.
+---Handles both data URIs (data:image/png;base64,...) and HTTP URLs.
+---@param output table Output object with text/html data
+---@return table[] images Array of {mime, data, is_text} entries
+function M.extract_html_images(output)
+	local images = {}
+
+	if output.output_type ~= "execute_result" and output.output_type ~= "display_data" then
+		return images
+	end
+
+	local data = output.data
+	if not data or not data["text/html"] then
+		return images
+	end
+
+	local html = data["text/html"]
+	if type(html) == "table" then
+		html = table.concat(html, "")
+	end
+
+	-- Match <img> tags with src attribute (handles various quoting and attributes)
+	for img_tag in html:gmatch("<img[^>]+>") do
+		local src = img_tag:match('src=["\']([^"\']+)["\']')
+		if not src then
+			src = img_tag:match("src=([^%s>]+)")
+		end
+		if src then
+			-- Handle data URIs
+			local mime_match, b64_data = src:match("^data:(image/%w+);base64,(.+)$")
+			if mime_match and b64_data then
+				images[#images + 1] = { mime = mime_match, data = b64_data, is_text = false }
+			elseif src:match("^https?://") then
+				-- HTTP URL - download to cache and read
+				local cache_dir = get_cache_dir()
+				local ext = src:match("%.([%w]+)%??") or "png"
+				local filename = "html-" .. vim.fn.sha256(src):sub(1, 16) .. "." .. ext
+				local filepath = cache_dir .. "/" .. filename
+
+				-- Download if not cached
+				local f = io.open(filepath, "rb")
+				if not f then
+					os.execute(string.format('curl -sL -o "%s" "%s" 2>/dev/null', filepath, src))
+					f = io.open(filepath, "rb")
+				end
+
+				if f then
+					local content = f:read("*a")
+					f:close()
+					if content and #content > 0 then
+						-- Detect MIME from content or URL
+						local mime = "image/" .. ext
+						if ext == "jpg" then
+							mime = "image/jpeg"
+						end
+						images[#images + 1] = { mime = mime, data = content, is_text = false, filepath = filepath }
+					end
+				end
+			end
+		end
+	end
+
+	return images
+end
+
 ---Generate virt_lines entries for an image output.
 ---Dispatches to the Kitty placeholder path or the image.nvim native path.
 ---@param state NotebookState
@@ -625,45 +690,69 @@ function M.get_image_virt_lines(state, cell, output, image_index)
 		---------------------------------------------------------------
 		-- Path B: Other terminals — delegate to image.nvim rendering
 		---------------------------------------------------------------
-		-- Create an image associated with the notebook window/buffer
-		-- so image.nvim renders via its configured backend (ueberzug,
-		-- sixel, etc.).
-		if not facade_win then
-			return nil, 0
-		end
-
-		local native_img = get_or_create_image(cache_path, {
-			window = facade_win,
-			buffer = state.facade_buf,
-			with_virtual_padding = true,
-			inline = true,
-			width = img_width,
-			height = img_height,
+		-- Return empty virt_lines as placeholder. The actual image will
+		-- be rendered after the extmark is created via render_native_images(),
+		-- since image.nvim needs the real buffer line to position the image.
+		state.images = state.images or {}
+		state.images[cell_id] = state.images[cell_id] or {}
+		table.insert(state.images[cell_id], {
+			img = img,
+			path = cache_path,
+			img_width = img_width,
+			img_height = img_height,
+			facade_win = facade_win,
+			rendering = "native",
 		})
-		if not native_img then
-			return nil, 0
-		end
 
-		-- Let image.nvim handle rendering via its backend.
-		-- It will create its own extmark with virtual padding.
-		pcall(native_img.render, native_img)
-
-		-- Reserve virt_lines space so the cell output stays clear.
-		-- We return empty lines; the actual image is rendered by image.nvim.
+		-- Return empty virt_lines for spacing (actual render deferred)
 		local virt_line_entries = {}
 		for _ = 1, img_height do
 			table.insert(virt_line_entries, { { "", "" } })
 		end
 
-		state.images = state.images or {}
-		state.images[cell_id] = state.images[cell_id] or {}
-		table.insert(state.images[cell_id], {
-			img = native_img,
-			path = cache_path,
-			rendering = "native",
-		})
-
 		return virt_line_entries, img_height
+	end
+end
+
+---Render deferred native images at the correct buffer line positions.
+---Must be called after the output extmark is created.
+---@param state NotebookState
+---@param cell_id string Cell ID
+---@param base_line number Buffer line where the extmark starts
+---@param virt_line_offsets table Array of {cell_id, virt_line_offset} for each native image
+function M.render_native_images(state, cell_id, base_line, virt_line_offsets)
+	if not state.images or not state.images[cell_id] then
+		return
+	end
+
+	local native_images = {}
+	for _, entry in ipairs(state.images[cell_id]) do
+		if entry.rendering == "native" then
+			table.insert(native_images, entry)
+		end
+	end
+
+	if #native_images == 0 then
+		return
+	end
+
+	-- Render each native image at its correct position
+	for i, entry in ipairs(native_images) do
+		local offset = virt_line_offsets[i] or 0
+		local target_line = base_line + offset
+
+		if entry.img and entry.facade_win then
+			-- Set geometry.y to the target line so image.nvim places the extmark correctly
+			entry.img.geometry.y = target_line
+			entry.img.geometry.x = 0
+
+			-- Render via image.nvim's backend (sixel, ueberzug, etc.)
+			-- with_virtual_padding will create an extmark at target_line
+			pcall(entry.img.render, entry.img, {
+				y = target_line,
+				x = 0,
+			})
+		end
 	end
 end
 

@@ -216,33 +216,101 @@ function M.render_outputs(state, cell_idx, skip_image_render)
   -- Build all virt_lines in order with true interleaving
   local virt_lines = {}
   local image_index = 0
+  local native_image_offsets = {} -- Track virt_line offsets for native image rendering
+  local native_image_count = 0
+  local cumulative_virt_lines = 0
 
   -- Output separator
   table.insert(virt_lines, { { '┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄', 'IpynbBorder' } })
+  cumulative_virt_lines = cumulative_virt_lines + 1
 
   for _, output in ipairs(cell.outputs) do
     local has_image = images_mod.get_image_data(output)
 
-    if has_image and images_mod.supports_placeholders() then
-      -- Get image placeholder lines for true interleaving
+    if has_image and images_mod.is_available() then
+      -- Get image virt_lines (Kitty placeholders or native rendering)
       image_index = image_index + 1
-      local img_lines, _ = images_mod.get_image_virt_lines(state, cell, output, image_index)
+      local img_lines, img_height = images_mod.get_image_virt_lines(state, cell, output, image_index)
       if img_lines then
+        -- Check if this is a native (non-Kitty) image by looking at state.images
+        local is_native = false
+        if cell.id and state.images and state.images[cell.id] then
+          local last_img = state.images[cell.id][#state.images[cell.id]]
+          if last_img and last_img.rendering == "native" then
+            is_native = true
+            native_image_count = native_image_count + 1
+            -- Record the virt_line offset where this image starts
+            native_image_offsets[native_image_count] = cumulative_virt_lines
+          end
+        end
         for _, line in ipairs(img_lines) do
           table.insert(virt_lines, line)
         end
+        cumulative_virt_lines = cumulative_virt_lines + (img_height or 0)
       else
         -- Fallback if image loading failed
         table.insert(virt_lines, { { '[Image failed to load]', 'Comment' } })
+        cumulative_virt_lines = cumulative_virt_lines + 1
       end
-    elseif has_image and images_mod.is_available() then
-      -- Terminal doesn't support placeholders, show placeholder text
-      table.insert(virt_lines, { { '[Image - placeholders not supported]', 'Comment' } })
+    elseif has_image then
+      table.insert(virt_lines, { { '[Image output - install image.nvim to view]', 'Comment' } })
+      cumulative_virt_lines = cumulative_virt_lines + 1
+    elseif images_mod.is_available() then
+      -- Check for HTML-embedded images (e.g., <img src="..."> in text/html output)
+      local html_images = images_mod.extract_html_images(output)
+      if #html_images > 0 then
+        for _, img_entry in ipairs(html_images) do
+          -- Create a synthetic output with image MIME type
+          local synthetic_output = {
+            output_type = output.output_type,
+            data = { [img_entry.mime] = img_entry.data },
+          }
+          image_index = image_index + 1
+          local img_lines, img_height = images_mod.get_image_virt_lines(state, cell, synthetic_output, image_index)
+          if img_lines then
+            local is_native = false
+            if cell.id and state.images and state.images[cell.id] then
+              local last_img = state.images[cell.id][#state.images[cell.id]]
+              if last_img and last_img.rendering == "native" then
+                is_native = true
+                native_image_count = native_image_count + 1
+                native_image_offsets[native_image_count] = cumulative_virt_lines
+              end
+            end
+            for _, line in ipairs(img_lines) do
+              table.insert(virt_lines, line)
+            end
+            cumulative_virt_lines = cumulative_virt_lines + (img_height or 0)
+          else
+            table.insert(virt_lines, { { '[Image failed to load]', 'Comment' } })
+            cumulative_virt_lines = cumulative_virt_lines + 1
+          end
+        end
+        -- Also render text/plain if present (as caption)
+        if output.data and output.data['text/plain'] then
+          local rendered = M.render_output({
+            output_type = output.output_type,
+            data = { ['text/plain'] = output.data['text/plain'] },
+          })
+          for _, line in ipairs(rendered) do
+            table.insert(virt_lines, line)
+            cumulative_virt_lines = cumulative_virt_lines + 1
+          end
+        end
+      else
+        -- No images, render normally
+        local rendered = M.render_output(output)
+        for _, line in ipairs(rendered) do
+          table.insert(virt_lines, line)
+          cumulative_virt_lines = cumulative_virt_lines + 1
+        end
+      end
     else
       -- Add text lines to virt_lines array
       local rendered = M.render_output(output)
       for _, line in ipairs(rendered) do
         table.insert(virt_lines, line)
+        cumulative_virt_lines = cumulative_virt_lines + 1
       end
     end
   end
@@ -255,6 +323,11 @@ function M.render_outputs(state, cell_idx, skip_image_render)
       undo_restore = false,
       strict = false,
     })
+
+    -- Render deferred native images at their correct buffer line positions
+    if native_image_count > 0 and cell.id then
+      images_mod.render_native_images(state, cell.id, end_line, native_image_offsets)
+    end
   end
 end
 
