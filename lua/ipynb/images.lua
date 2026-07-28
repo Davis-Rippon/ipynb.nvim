@@ -814,12 +814,13 @@ function M.render_native_images(state, cell_id, base_line, virt_line_offsets)
 		local target_line = base_line + offset
 
 		if entry.img and entry.facade_win then
-			-- Set geometry.y to the target line so image.nvim places the extmark correctly
+			-- Assign window/buffer so image.nvim can compute screen position
+			entry.img.window = entry.facade_win
+			entry.img.buffer = state.facade_buf
 			entry.img.geometry.y = target_line
 			entry.img.geometry.x = 0
 
 			-- Render via image.nvim's backend (sixel, ueberzug, etc.)
-			-- with_virtual_padding will create an extmark at target_line
 			pcall(entry.img.render, entry.img, {
 				y = target_line,
 				x = 0,
