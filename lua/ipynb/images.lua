@@ -762,9 +762,9 @@ function M.get_image_virt_lines(state, cell, output, image_index)
 		---------------------------------------------------------------
 		-- Path B: Other terminals — delegate to image.nvim rendering
 		---------------------------------------------------------------
-		-- Return empty virt_lines as placeholder. The actual image will
-		-- be rendered after the extmark is created via render_native_images(),
-		-- since image.nvim needs the real buffer line to position the image.
+		-- Store image info for deferred render. image.nvim will handle
+		-- both rendering and virtual padding via with_virtual_padding.
+		-- Return no virt_lines — image.nvim creates its own extmark.
 		state.images = state.images or {}
 		state.images[cell_id] = state.images[cell_id] or {}
 		table.insert(state.images[cell_id], {
@@ -776,23 +776,17 @@ function M.get_image_virt_lines(state, cell, output, image_index)
 			rendering = "native",
 		})
 
-		-- Return empty virt_lines for spacing (actual render deferred)
-		local virt_line_entries = {}
-		for _ = 1, img_height do
-			table.insert(virt_line_entries, { { "", "" } })
-		end
-
-		return virt_line_entries, img_height
+		return {}, img_height
 	end
 end
 
 ---Render deferred native images at the correct buffer line positions.
 ---Must be called after the output extmark is created.
+---image.nvim handles stacking via with_virtual_padding.
 ---@param state NotebookState
 ---@param cell_id string Cell ID
 ---@param base_line number Buffer line where the extmark starts
----@param virt_line_offsets table Array of {cell_id, virt_line_offset} for each native image
-function M.render_native_images(state, cell_id, base_line, virt_line_offsets)
+function M.render_native_images(state, cell_id, base_line)
 	if not state.images or not state.images[cell_id] then
 		return
 	end
@@ -808,21 +802,23 @@ function M.render_native_images(state, cell_id, base_line, virt_line_offsets)
 		return
 	end
 
-	-- Render each native image at its correct position
-	for i, entry in ipairs(native_images) do
-		local offset = virt_line_offsets[i] or 0
-		local target_line = base_line + offset
-
+	-- Render each native image at the base_line position.
+	-- image.nvim handles stacking: it re-renders images below when
+	-- a new one is placed, creating its own extmark with virtual padding.
+	for _, entry in ipairs(native_images) do
 		if entry.img and entry.facade_win then
 			-- Assign window/buffer so image.nvim can compute screen position
 			entry.img.window = entry.facade_win
 			entry.img.buffer = state.facade_buf
-			entry.img.geometry.y = target_line
+			-- Let image.nvim handle virtual padding (creates its own extmark)
+			entry.img.with_virtual_padding = true
+			entry.img.inline = true
+			entry.img.geometry.y = base_line
 			entry.img.geometry.x = 0
 
 			-- Render via image.nvim's backend (sixel, ueberzug, etc.)
 			pcall(entry.img.render, entry.img, {
-				y = target_line,
+				y = base_line,
 				x = 0,
 			})
 		end
