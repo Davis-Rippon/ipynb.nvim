@@ -570,7 +570,7 @@ end
 ---Extract image data from HTML content containing <img> tags.
 ---Handles both data URIs (data:image/png;base64,...) and HTTP URLs.
 ---@param output table Output object with text/html data
----@return table[] images Array of {mime, data, is_text} entries
+---@return table[] images Array of {mime, data, is_text, src} entries
 function M.extract_html_images(output)
 	local images = {}
 
@@ -588,7 +588,16 @@ function M.extract_html_images(output)
 		html = table.concat(html, "")
 	end
 
-	-- Match <img> tags with src attribute (handles various quoting and attributes)
+	return M._parse_img_tags(html)
+end
+
+---Parse <img> tags from any HTML string and extract image data.
+---Used by both cell output HTML and markdown source HTML.
+---@param html string HTML content
+---@return table[] images Array of {mime, data, is_text, src} entries
+function M._parse_img_tags(html)
+	local images = {}
+
 	for img_tag in html:gmatch("<img[^>]+>") do
 		local src = img_tag:match('src=["\']([^"\']+)["\']')
 		if not src then
@@ -596,13 +605,18 @@ function M.extract_html_images(output)
 		end
 		if src then
 			-- Handle data URIs
-			local mime_match, b64_data = src:match("^data:(image/%w+);base64,(.+)$")
+			local mime_match, b64_data = src:match("^data:(image/[%w+.]+);base64,(.+)$")
+			if not mime_match then
+				mime_match, b64_data = src:match("^data:(image/%w+);base64,(.+)$")
+			end
 			if mime_match and b64_data then
-				images[#images + 1] = { mime = mime_match, data = b64_data, is_text = false }
+				images[#images + 1] = { mime = mime_match, data = b64_data, is_text = false, src = src }
 			elseif src:match("^https?://") then
 				-- HTTP URL - download to cache and read
 				local cache_dir = get_cache_dir()
-				local ext = src:match("%.([%w]+)%??") or "png"
+				-- Extract extension from URL path (after stripping query string)
+				local path_part = src:match("^([^?]+)")
+				local ext = path_part and path_part:match("%.([%w]+)$") or "png"
 				local filename = "html-" .. vim.fn.sha256(src):sub(1, 16) .. "." .. ext
 				local filepath = cache_dir .. "/" .. filename
 
@@ -617,12 +631,13 @@ function M.extract_html_images(output)
 					local content = f:read("*a")
 					f:close()
 					if content and #content > 0 then
-						-- Detect MIME from content or URL
 						local mime = "image/" .. ext
 						if ext == "jpg" then
 							mime = "image/jpeg"
 						end
-						images[#images + 1] = { mime = mime, data = content, is_text = false, filepath = filepath }
+						-- Base64-encode so prepare_image can decode it correctly
+						local b64 = vim.base64.encode(content)
+						images[#images + 1] = { mime = mime, data = b64, is_text = false, filepath = filepath, src = src }
 					end
 				end
 			end
@@ -630,6 +645,63 @@ function M.extract_html_images(output)
 	end
 
 	return images
+end
+
+---Extract images from markdown cell source text.
+---Scans for <img> tags and returns image data suitable for rendering.
+---@param source string Markdown cell source text
+---@return table[] images Array of {mime, data, is_text, src} entries
+function M.extract_markdown_images(source)
+	if not source or source == "" then
+		return {}
+	end
+	return M._parse_img_tags(source)
+end
+
+---Render images found in a markdown cell source as virt_lines.
+---Returns virt_line entries to be placed on the cell's end marker line.
+---@param state NotebookState
+---@param cell table Markdown cell object
+---@return table[]|nil virt_line_entries Array of virt_line entries, or nil if no images
+---@return number total_height Total height in terminal rows
+function M.get_markdown_image_virt_lines(state, cell)
+	if not M.is_available() then
+		return nil, 0
+	end
+
+	local source_images = M.extract_markdown_images(cell.source)
+	if #source_images == 0 then
+		return nil, 0
+	end
+
+	local virt_lines = {}
+	local total_height = 0
+	local cell_id = cell.id
+
+	for image_index, img_entry in ipairs(source_images) do
+		-- Create a synthetic output with the image MIME type
+		local synthetic_output = {
+			output_type = "display_data",
+			data = { [img_entry.mime] = img_entry.data },
+		}
+
+		local img_lines, img_height = M.get_image_virt_lines(state, cell, synthetic_output, image_index)
+		if img_lines then
+			for _, line in ipairs(img_lines) do
+				table.insert(virt_lines, line)
+			end
+			total_height = total_height + (img_height or 0)
+		else
+			table.insert(virt_lines, { { "[Image failed to load]", "Comment" } })
+			total_height = total_height + 1
+		end
+	end
+
+	if #virt_lines == 0 then
+		return nil, 0
+	end
+
+	return virt_lines, total_height
 end
 
 ---Generate virt_lines entries for an image output.

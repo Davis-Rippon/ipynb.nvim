@@ -372,12 +372,71 @@ end
 ---Render all cell outputs
 ---@param state NotebookState
 function M.render_all(state)
+  local cells_mod = require('ipynb.cells')
+
   -- Render each cell's outputs fully (including images) before moving to next cell
   -- This maintains correct text/image interleaving within each cell
   for i, cell in ipairs(state.cells) do
     if cell.type == 'code' and cell.outputs and #cell.outputs > 0 then
       M.render_outputs(state, i, false)  -- render images synchronously
+    elseif cell.type == 'markdown' then
+      M.render_markdown_images(state, i)
     end
+  end
+end
+
+---Render images found in markdown cell source as inline virt_lines
+---@param state NotebookState
+---@param cell_idx number
+function M.render_markdown_images(state, cell_idx)
+  local cell = state.cells[cell_idx]
+  if not cell or cell.type ~= 'markdown' then
+    return
+  end
+
+  local cells_mod = require('ipynb.cells')
+  local images_mod = require('ipynb.images')
+  local _, end_line = cells_mod.get_cell_range(state, cell_idx)
+
+  -- Clear old extmark for this cell
+  if cell.output_extmark then
+    pcall(vim.api.nvim_buf_del_extmark, state.facade_buf, output_ns, cell.output_extmark)
+    cell.output_extmark = nil
+  end
+
+  -- Clear existing images
+  if cell.id then
+    images_mod.clear_images(state, cell.id)
+  end
+
+  -- Check for images in markdown source
+  local virt_lines, height = images_mod.get_markdown_image_virt_lines(state, cell)
+  if not virt_lines or #virt_lines == 0 then
+    return
+  end
+
+  -- Create extmark with virt_lines on the end marker line
+  cell.output_extmark = vim.api.nvim_buf_set_extmark(state.facade_buf, output_ns, end_line, 0, {
+    virt_lines = virt_lines,
+    undo_restore = false,
+    strict = false,
+  })
+
+  -- Render deferred native images if any
+  local native_image_offsets = {}
+  local native_count = 0
+  local cumulative = 0
+  if cell.id and state.images and state.images[cell.id] then
+    for _, entry in ipairs(state.images[cell.id]) do
+      if entry.rendering == "native" then
+        native_count = native_count + 1
+        native_image_offsets[native_count] = cumulative
+      end
+      cumulative = cumulative + (entry.img_height or 0)
+    end
+  end
+  if native_count > 0 and cell.id then
+    images_mod.render_native_images(state, cell.id, end_line, native_image_offsets)
   end
 end
 
